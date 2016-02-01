@@ -292,7 +292,7 @@ func (m *Master) initV1ResourcesStorage(c *Config) {
 		m.ProxyTransport,
 	)
 
-	serviceStorage := serviceetcd.NewREST(dbClient("services"), storageDecorator)
+	serviceStorage, serviceStatusStorage := serviceetcd.NewREST(dbClient("services"), storageDecorator)
 	m.serviceRegistry = service.NewRegistry(serviceStorage)
 
 	var serviceClusterIPRegistry service.RangeRegistry
@@ -336,6 +336,7 @@ func (m *Master) initV1ResourcesStorage(c *Config) {
 		"replicationControllers":        controllerStorage,
 		"replicationControllers/status": controllerStatusStorage,
 		"services":                      service.NewStorage(m.serviceRegistry, m.endpointRegistry, serviceClusterIPAllocator, serviceNodePortAllocator, m.ProxyTransport),
+		"services/status":               serviceStatusStorage,
 		"endpoints":                     endpointsStorage,
 		"nodes":                         nodeStorage,
 		"nodes/status":                  nodeStatusStorage,
@@ -622,6 +623,7 @@ func (m *Master) getExtensionResources(c *Config) map[string]rest.Storage {
 		storage["deployments"] = deploymentStorage.Deployment
 		storage["deployments/status"] = deploymentStorage.Status
 		storage["deployments/scale"] = deploymentStorage.Scale
+		storage["deployments/rollback"] = deploymentStorage.Rollback
 	}
 	if isEnabled("jobs") {
 		jobStorage, jobStatusStorage := jobetcd.NewREST(dbClient("jobs"), storageDecorator)

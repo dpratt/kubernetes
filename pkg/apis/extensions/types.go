@@ -30,6 +30,7 @@ package extensions
 
 import (
 	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/kubernetes/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/util/intstr"
 )
@@ -85,6 +86,29 @@ type CPUTargetUtilization struct {
 	// fraction of the requested CPU that should be utilized/used,
 	// e.g. 70 means that 70% of the requested CPU should be in use.
 	TargetPercentage int `json:"targetPercentage"`
+}
+
+// Alpha-level support for Custom Metrics in HPA (as annotations).
+type CustomMetricTarget struct {
+	// Custom Metric name.
+	Name string `json:"name"`
+	// Custom Metric value (average).
+	TargetValue resource.Quantity `json:"value"`
+}
+
+type CustomMetricTargetList struct {
+	Items []CustomMetricTarget `json:"items"`
+}
+
+type CustomMetricCurrentStatus struct {
+	// Custom Metric name.
+	Name string `json:"name"`
+	// Custom Metric value (average).
+	CurrentValue resource.Quantity `json:"value"`
+}
+
+type CustomMetricCurrentStatusList struct {
+	Items []CustomMetricCurrentStatus `json:"items"`
 }
 
 // specification of a horizontal pod autoscaler.
@@ -236,6 +260,24 @@ type DeploymentSpec struct {
 	// Indicates that the deployment is paused and will not be processed by the
 	// deployment controller.
 	Paused bool `json:"paused,omitempty"`
+	// The config this deployment is rolling back to. Will be cleared after rollback is done.
+	RollbackTo *RollbackConfig `json:"rollbackTo,omitempty"`
+}
+
+// DeploymentRollback stores the information required to rollback a deployment.
+type DeploymentRollback struct {
+	unversioned.TypeMeta `json:",inline"`
+	// Required: This must match the Name of a deployment.
+	Name string `json:"name"`
+	// The annotations to be updated to a deployment
+	UpdatedAnnotations map[string]string `json:"updatedAnnotations,omitempty"`
+	// The config of this deployment rollback.
+	RollbackTo RollbackConfig `json:"rollbackTo"`
+}
+
+type RollbackConfig struct {
+	// The revision to rollback to. If set to 0, rollbck to the last revision.
+	Revision int64 `json:"revision,omitempty"`
 }
 
 const (
@@ -787,6 +829,8 @@ const (
 	LabelSelectorOpExists       LabelSelectorOperator = "Exists"
 	LabelSelectorOpDoesNotExist LabelSelectorOperator = "DoesNotExist"
 )
+
+// +genclient=true
 
 // ReplicaSet represents the configuration of a replica set.
 type ReplicaSet struct {

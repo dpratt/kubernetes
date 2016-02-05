@@ -18,11 +18,12 @@ package deployment
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/apis/extensions"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_1"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_2"
 	"k8s.io/kubernetes/pkg/labels"
 	labelsutil "k8s.io/kubernetes/pkg/util/labels"
 	podutil "k8s.io/kubernetes/pkg/util/pod"
@@ -31,6 +32,11 @@ import (
 const (
 	// The revision annotation of a deployment's replication controllers which records its rollout sequence
 	RevisionAnnotation = "deployment.kubernetes.io/revision"
+
+	// Here are the possible rollback event reasons
+	RollbackRevisionNotFound  = "DeploymentRollbackRevisionNotFound"
+	RollbackTemplateUnchanged = "DeploymentRollbackTemplateUnchanged"
+	RollbackDone              = "DeploymentRollback"
 )
 
 // GetOldRCs returns the old RCs targeted by the given Deployment; get PodList and RCList from client interface.
@@ -38,10 +44,10 @@ const (
 func GetOldRCs(deployment extensions.Deployment, c clientset.Interface) ([]*api.ReplicationController, []*api.ReplicationController, error) {
 	return GetOldRCsFromLists(deployment, c,
 		func(namespace string, options api.ListOptions) (*api.PodList, error) {
-			return c.Legacy().Pods(namespace).List(options)
+			return c.Core().Pods(namespace).List(options)
 		},
 		func(namespace string, options api.ListOptions) ([]api.ReplicationController, error) {
-			rcList, err := c.Legacy().ReplicationControllers(namespace).List(options)
+			rcList, err := c.Core().ReplicationControllers(namespace).List(options)
 			return rcList.Items, err
 		})
 }
@@ -98,7 +104,7 @@ func GetOldRCsFromLists(deployment extensions.Deployment, c clientset.Interface,
 func GetNewRC(deployment extensions.Deployment, c clientset.Interface) (*api.ReplicationController, error) {
 	return GetNewRCFromList(deployment, c,
 		func(namespace string, options api.ListOptions) ([]api.ReplicationController, error) {
-			rcList, err := c.Legacy().ReplicationControllers(namespace).List(options)
+			rcList, err := c.Core().ReplicationControllers(namespace).List(options)
 			return rcList.Items, err
 		})
 }
@@ -194,11 +200,20 @@ func getPodsForRCs(c clientset.Interface, replicationControllers []*api.Replicat
 	for _, rc := range replicationControllers {
 		selector := labels.SelectorFromSet(rc.Spec.Selector)
 		options := api.ListOptions{LabelSelector: selector}
-		podList, err := c.Legacy().Pods(rc.ObjectMeta.Namespace).List(options)
+		podList, err := c.Core().Pods(rc.ObjectMeta.Namespace).List(options)
 		if err != nil {
 			return allPods, fmt.Errorf("error listing pods: %v", err)
 		}
 		allPods = append(allPods, podList.Items...)
 	}
 	return allPods, nil
+}
+
+// Revision returns the revision number of the input RC
+func Revision(rc *api.ReplicationController) (int64, error) {
+	v, ok := rc.Annotations[RevisionAnnotation]
+	if !ok {
+		return 0, nil
+	}
+	return strconv.ParseInt(v, 10, 64)
 }

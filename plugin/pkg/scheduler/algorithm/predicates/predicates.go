@@ -133,6 +133,141 @@ func NoDiskConflict(pod *api.Pod, existingPods []*api.Pod, node string) (bool, e
 	return true, nil
 }
 
+type MaxPDVolumeCountChecker struct {
+	filter     VolumeFilter
+	maxVolumes int
+	pvInfo     PersistentVolumeInfo
+	pvcInfo    PersistentVolumeClaimInfo
+}
+
+// VolumeFilter contains information on how to filter PD Volumes when checking PD Volume caps
+type VolumeFilter struct {
+	// Filter normal volumes
+	FilterVolume           func(vol *api.Volume) (id string, relevant bool)
+	FilterPersistentVolume func(pv *api.PersistentVolume) (id string, relevant bool)
+}
+
+// NewMaxPDVolumeCountPredicate creates a predicate which evaluates whether a pod can fit based on the
+// number of volumes which match a filter that it requests, and those that are already present.  The
+// maximum number is configurable to accommodate different systems.
+//
+// The predicate looks for both volumes used directly, as well as PVC volumes that are backed by relevant volume
+// types, counts the number of unique volumes, and rejects the new pod if it would place the total count over
+// the maximum.
+func NewMaxPDVolumeCountPredicate(filter VolumeFilter, maxVolumes int, pvInfo PersistentVolumeInfo, pvcInfo PersistentVolumeClaimInfo) algorithm.FitPredicate {
+	c := &MaxPDVolumeCountChecker{
+		filter:     filter,
+		maxVolumes: maxVolumes,
+		pvInfo:     pvInfo,
+		pvcInfo:    pvcInfo,
+	}
+
+	return c.predicate
+}
+
+func (c *MaxPDVolumeCountChecker) filterVolumes(volumes []api.Volume, namespace string, filteredVolumes map[string]bool) error {
+	for _, vol := range volumes {
+		if id, ok := c.filter.FilterVolume(&vol); ok {
+			filteredVolumes[id] = true
+		} else if vol.PersistentVolumeClaim != nil {
+			pvcName := vol.PersistentVolumeClaim.ClaimName
+			if pvcName == "" {
+				return fmt.Errorf("PersistentVolumeClaim had no name: %q", pvcName)
+			}
+			pvc, err := c.pvcInfo.GetPersistentVolumeClaimInfo(namespace, pvcName)
+			if err != nil {
+				return err
+			}
+
+			pvName := pvc.Spec.VolumeName
+			if pvName == "" {
+				return fmt.Errorf("PersistentVolumeClaim is not bound: %q", pvcName)
+			}
+
+			pv, err := c.pvInfo.GetPersistentVolumeInfo(pvName)
+			if err != nil {
+				return err
+			}
+
+			if id, ok := c.filter.FilterPersistentVolume(pv); ok {
+				filteredVolumes[id] = true
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *MaxPDVolumeCountChecker) predicate(pod *api.Pod, existingPods []*api.Pod, node string) (bool, error) {
+	newVolumes := make(map[string]bool)
+	if err := c.filterVolumes(pod.Spec.Volumes, pod.Namespace, newVolumes); err != nil {
+		return false, err
+	}
+
+	// quick return
+	if len(newVolumes) == 0 {
+		return true, nil
+	}
+
+	// count unique volumes
+	existingVolumes := make(map[string]bool)
+	for _, existingPod := range existingPods {
+		if err := c.filterVolumes(existingPod.Spec.Volumes, existingPod.Namespace, existingVolumes); err != nil {
+			return false, err
+		}
+	}
+	numExistingVolumes := len(existingVolumes)
+
+	// filter out already-mounted volumes
+	for k := range existingVolumes {
+		if _, ok := newVolumes[k]; ok {
+			delete(newVolumes, k)
+		}
+	}
+
+	numNewVolumes := len(newVolumes)
+
+	if numExistingVolumes+numNewVolumes > c.maxVolumes {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// EBSVolumeFilter is a VolumeFilter for filtering AWS ElasticBlockStore Volumes
+var EBSVolumeFilter VolumeFilter = VolumeFilter{
+	FilterVolume: func(vol *api.Volume) (string, bool) {
+		if vol.AWSElasticBlockStore != nil {
+			return vol.AWSElasticBlockStore.VolumeID, true
+		}
+		return "", false
+	},
+
+	FilterPersistentVolume: func(pv *api.PersistentVolume) (string, bool) {
+		if pv.Spec.AWSElasticBlockStore != nil {
+			return pv.Spec.AWSElasticBlockStore.VolumeID, true
+		}
+		return "", false
+	},
+}
+
+// GCEPDVolumeFilter is a VolumeFilter for filtering GCE PersistentDisk Volumes
+var GCEPDVolumeFilter VolumeFilter = VolumeFilter{
+	FilterVolume: func(vol *api.Volume) (string, bool) {
+		if vol.GCEPersistentDisk != nil {
+			return vol.GCEPersistentDisk.PDName, true
+		}
+		return "", false
+	},
+
+	FilterPersistentVolume: func(pv *api.PersistentVolume) (string, bool) {
+		if pv.Spec.GCEPersistentDisk != nil {
+			return pv.Spec.GCEPersistentDisk.PDName, true
+		}
+		return "", false
+	},
+}
+
 type VolumeZoneChecker struct {
 	nodeInfo NodeInfo
 	pvInfo   PersistentVolumeInfo
@@ -273,8 +408,8 @@ func CheckPodsExceedingFreeResources(pods []*api.Pod, allocatable api.ResourceLi
 	memoryRequested := int64(0)
 	for _, pod := range pods {
 		podRequest := getResourceRequest(pod)
-		fitsCPU := totalMilliCPU == 0 || (totalMilliCPU-milliCPURequested) >= podRequest.milliCPU
-		fitsMemory := totalMemory == 0 || (totalMemory-memoryRequested) >= podRequest.memory
+		fitsCPU := (totalMilliCPU - milliCPURequested) >= podRequest.milliCPU
+		fitsMemory := (totalMemory - memoryRequested) >= podRequest.memory
 		if !fitsCPU {
 			// the pod doesn't fit due to CPU request
 			notFittingCPU = append(notFittingCPU, pod)
@@ -343,12 +478,70 @@ func NewSelectorMatchPredicate(info NodeInfo) algorithm.FitPredicate {
 	return selector.PodSelectorMatches
 }
 
-func PodMatchesNodeLabels(pod *api.Pod, node *api.Node) bool {
-	if len(pod.Spec.NodeSelector) == 0 {
-		return true
+// NodeMatchesNodeSelectorTerms checks if a node's labels satisfy a list of node selector terms,
+// terms are ORed, and an emtpy a list of terms will match nothing.
+func NodeMatchesNodeSelectorTerms(node *api.Node, nodeSelectorTerms []api.NodeSelectorTerm) bool {
+	for _, req := range nodeSelectorTerms {
+		nodeSelector, err := api.NodeSelectorRequirementsAsSelector(req.MatchExpressions)
+		if err != nil {
+			glog.V(10).Infof("Failed to parse MatchExpressions: %+v, regarding as not match.", req.MatchExpressions)
+			return false
+		}
+		if nodeSelector.Matches(labels.Set(node.Labels)) {
+			return true
+		}
 	}
-	selector := labels.SelectorFromSet(pod.Spec.NodeSelector)
-	return selector.Matches(labels.Set(node.Labels))
+	return false
+}
+
+// The pod can only schedule onto nodes that satisfy requirements in both NodeAffinity and nodeSelector.
+func PodMatchesNodeLabels(pod *api.Pod, node *api.Node) bool {
+	// Check if node.Labels match pod.Spec.NodeSelector.
+	if len(pod.Spec.NodeSelector) > 0 {
+		selector := labels.SelectorFromSet(pod.Spec.NodeSelector)
+		if !selector.Matches(labels.Set(node.Labels)) {
+			return false
+		}
+	}
+
+	// Parse required node affinity scheduling requirements
+	// and check if the current node match the requirements.
+	affinity, err := api.GetAffinityFromPodAnnotations(pod.Annotations)
+	if err != nil {
+		glog.V(10).Infof("Failed to get Affinity from Pod %+v, err: %+v", podName(pod), err)
+		return false
+	}
+
+	// 1. nil NodeSelector matches all nodes (i.e. does not filter out any nodes)
+	// 2. nil []NodeSelectorTerm (equivalent to non-nil empty NodeSelector) matches no nodes
+	// 3. zero-length non-nil []NodeSelectorTerm matches no nodes also, just for simplicity
+	// 4. nil []NodeSelectorRequirement (equivalent to non-nil empty NodeSelectorTerm) matches no nodes
+	// 5. zero-length non-nil []NodeSelectorRequirement matches no nodes also, just for simplicity
+	// 6. non-nil empty NodeSelectorRequirement is not allowed
+	nodeAffinityMatches := true
+	if affinity.NodeAffinity != nil {
+		nodeAffinity := affinity.NodeAffinity
+		// if no required NodeAffinity requirements, will do no-op, means select all nodes.
+		if nodeAffinity.RequiredDuringSchedulingRequiredDuringExecution == nil && nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+			return true
+		}
+
+		// Match node selector for requiredDuringSchedulingRequiredDuringExecution.
+		if nodeAffinity.RequiredDuringSchedulingRequiredDuringExecution != nil {
+			nodeSelectorTerms := nodeAffinity.RequiredDuringSchedulingRequiredDuringExecution.NodeSelectorTerms
+			glog.V(10).Infof("Match for RequiredDuringSchedulingRequiredDuringExecution node selector terms %+v", nodeSelectorTerms)
+			nodeAffinityMatches = NodeMatchesNodeSelectorTerms(node, nodeSelectorTerms)
+		}
+
+		// Match node selector for requiredDuringSchedulingRequiredDuringExecution.
+		if nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+			nodeSelectorTerms := nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+			glog.V(10).Infof("Match for RequiredDuringSchedulingIgnoredDuringExecution node selector terms %+v", nodeSelectorTerms)
+			nodeAffinityMatches = nodeAffinityMatches && NodeMatchesNodeSelectorTerms(node, nodeSelectorTerms)
+		}
+
+	}
+	return nodeAffinityMatches
 }
 
 type NodeSelector struct {

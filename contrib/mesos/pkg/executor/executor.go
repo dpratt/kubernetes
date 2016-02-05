@@ -26,6 +26,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_2"
+
 	"github.com/fsouza/go-dockerclient"
 	"github.com/gogo/protobuf/proto"
 	log "github.com/golang/glog"
@@ -40,11 +42,10 @@ import (
 	"k8s.io/kubernetes/contrib/mesos/pkg/scheduler/meta"
 	"k8s.io/kubernetes/pkg/api"
 	apierrors "k8s.io/kubernetes/pkg/api/errors"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/dockertools"
 	kruntime "k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util"
+	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
 )
 
 const (
@@ -112,7 +113,7 @@ type Executor struct {
 }
 
 type Config struct {
-	APIClient            *client.Client
+	APIClient            *clientset.Clientset
 	Docker               dockertools.DockerInterface
 	ShutdownAlert        func()
 	SuicideTimeout       time.Duration
@@ -608,7 +609,7 @@ func (k *Executor) doShutdown(driver bindings.ExecutorDriver) {
 
 	if k.shutdownAlert != nil {
 		func() {
-			util.HandleCrash()
+			utilruntime.HandleCrash()
 			k.shutdownAlert()
 		}()
 	}

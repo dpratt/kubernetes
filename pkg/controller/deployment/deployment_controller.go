@@ -29,17 +29,19 @@ import (
 	"k8s.io/kubernetes/pkg/api/errors"
 	"k8s.io/kubernetes/pkg/apis/extensions"
 	"k8s.io/kubernetes/pkg/client/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_1"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_2"
 	"k8s.io/kubernetes/pkg/client/record"
-	unversioned_legacy "k8s.io/kubernetes/pkg/client/typed/generated/legacy/unversioned"
+	unversioned_core "k8s.io/kubernetes/pkg/client/typed/generated/core/unversioned"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/framework"
+	"k8s.io/kubernetes/pkg/kubectl"
 	"k8s.io/kubernetes/pkg/runtime"
 	"k8s.io/kubernetes/pkg/util"
 	deploymentutil "k8s.io/kubernetes/pkg/util/deployment"
 	utilerrors "k8s.io/kubernetes/pkg/util/errors"
 	labelsutil "k8s.io/kubernetes/pkg/util/labels"
 	podutil "k8s.io/kubernetes/pkg/util/pod"
+	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
 	"k8s.io/kubernetes/pkg/util/workqueue"
 	"k8s.io/kubernetes/pkg/watch"
 )
@@ -98,7 +100,7 @@ func NewDeploymentController(client clientset.Interface, resyncPeriod controller
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(glog.Infof)
 	// TODO: remove the wrapper when every clients have moved to use the clientset.
-	eventBroadcaster.StartRecordingToSink(&unversioned_legacy.EventSinkImpl{client.Legacy().Events("")})
+	eventBroadcaster.StartRecordingToSink(&unversioned_core.EventSinkImpl{client.Core().Events("")})
 
 	dc := &DeploymentController{
 		client:          client,
@@ -143,10 +145,10 @@ func NewDeploymentController(client clientset.Interface, resyncPeriod controller
 	dc.rcStore.Store, dc.rcController = framework.NewInformer(
 		&cache.ListWatch{
 			ListFunc: func(options api.ListOptions) (runtime.Object, error) {
-				return dc.client.Legacy().ReplicationControllers(api.NamespaceAll).List(options)
+				return dc.client.Core().ReplicationControllers(api.NamespaceAll).List(options)
 			},
 			WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
-				return dc.client.Legacy().ReplicationControllers(api.NamespaceAll).Watch(options)
+				return dc.client.Core().ReplicationControllers(api.NamespaceAll).Watch(options)
 			},
 		},
 		&api.ReplicationController{},
@@ -161,10 +163,10 @@ func NewDeploymentController(client clientset.Interface, resyncPeriod controller
 	dc.podStore.Store, dc.podController = framework.NewInformer(
 		&cache.ListWatch{
 			ListFunc: func(options api.ListOptions) (runtime.Object, error) {
-				return dc.client.Legacy().Pods(api.NamespaceAll).List(options)
+				return dc.client.Core().Pods(api.NamespaceAll).List(options)
 			},
 			WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
-				return dc.client.Legacy().Pods(api.NamespaceAll).Watch(options)
+				return dc.client.Core().Pods(api.NamespaceAll).Watch(options)
 			},
 		},
 		&api.Pod{},
@@ -185,7 +187,7 @@ func NewDeploymentController(client clientset.Interface, resyncPeriod controller
 
 // Run begins watching and syncing.
 func (dc *DeploymentController) Run(workers int, stopCh <-chan struct{}) {
-	defer util.HandleCrash()
+	defer utilruntime.HandleCrash()
 	go dc.dController.Run(stopCh)
 	go dc.rcController.Run(stopCh)
 	go dc.podController.Run(stopCh)
@@ -445,13 +447,13 @@ func (dc *DeploymentController) rollback(deployment *extensions.Deployment, toRe
 	if *toRevision == 0 {
 		if *toRevision = lastRevision(allRCs); *toRevision == 0 {
 			// If we still can't find the last revision, gives up rollback
-			dc.emitRollbackWarningEvent(deployment, "DeploymentRollbackRevisionNotFound", "Unable to find last revision.")
+			dc.emitRollbackWarningEvent(deployment, deploymentutil.RollbackRevisionNotFound, "Unable to find last revision.")
 			// Gives up rollback
 			return dc.updateDeploymentAndClearRollbackTo(deployment)
 		}
 	}
 	for _, rc := range allRCs {
-		v, err := revision(rc)
+		v, err := deploymentutil.Revision(rc)
 		if err != nil {
 			glog.V(4).Infof("Unable to extract revision from deployment's rc %q: %v", rc.Name, err)
 			continue
@@ -467,7 +469,7 @@ func (dc *DeploymentController) rollback(deployment *extensions.Deployment, toRe
 			return deployment, err
 		}
 	}
-	dc.emitRollbackWarningEvent(deployment, "DeploymentRollbackRevisionNotFound", "Unable to find the revision to rollback to.")
+	dc.emitRollbackWarningEvent(deployment, deploymentutil.RollbackRevisionNotFound, "Unable to find the revision to rollback to.")
 	// Gives up rollback
 	return dc.updateDeploymentAndClearRollbackTo(deployment)
 }
@@ -477,7 +479,7 @@ func (dc *DeploymentController) emitRollbackWarningEvent(deployment *extensions.
 }
 
 func (dc *DeploymentController) emitRollbackNormalEvent(deployment *extensions.Deployment, message string) {
-	dc.eventRecorder.Eventf(deployment, api.EventTypeNormal, "DeploymentRollback", message)
+	dc.eventRecorder.Eventf(deployment, api.EventTypeNormal, deploymentutil.RollbackDone, message)
 }
 
 // updateDeploymentAndClearRollbackTo sets .spec.rollbackTo to nil and update the input deployment
@@ -617,18 +619,10 @@ func (dc *DeploymentController) getNewRCAndAllOldRCs(deployment extensions.Deplo
 	return dc.getNewRCAndMaybeFilteredOldRCs(deployment, false)
 }
 
-func revision(rc *api.ReplicationController) (int64, error) {
-	v, ok := rc.Annotations[deploymentutil.RevisionAnnotation]
-	if !ok {
-		return 0, nil
-	}
-	return strconv.ParseInt(v, 10, 64)
-}
-
 func maxRevision(allRCs []*api.ReplicationController) int64 {
 	max := int64(0)
 	for _, rc := range allRCs {
-		if v, err := revision(rc); err != nil {
+		if v, err := deploymentutil.Revision(rc); err != nil {
 			// Skip the RCs when it failed to parse their revision information
 			glog.V(4).Infof("Error: %v. Couldn't parse revision for rc %#v, deployment controller will skip it when reconciling revisions.", err, rc)
 		} else if v > max {
@@ -642,7 +636,7 @@ func maxRevision(allRCs []*api.ReplicationController) int64 {
 func lastRevision(allRCs []*api.ReplicationController) int64 {
 	max, secMax := int64(0), int64(0)
 	for _, rc := range allRCs {
-		if v, err := revision(rc); err != nil {
+		if v, err := deploymentutil.Revision(rc); err != nil {
 			// Skip the RCs when it failed to parse their revision information
 			glog.V(4).Infof("Error: %v. Couldn't parse revision for rc %#v, deployment controller will skip it when reconciling revisions.", err, rc)
 		} else if v >= max {
@@ -682,13 +676,9 @@ func (dc *DeploymentController) getNewRC(deployment extensions.Deployment, maxOl
 	if err != nil {
 		return nil, err
 	} else if existingNewRC != nil {
-		if existingNewRC.Annotations == nil {
-			existingNewRC.Annotations = make(map[string]string)
-		}
-		if existingNewRC.Annotations[deploymentutil.RevisionAnnotation] != newRevision {
-			existingNewRC.Annotations[deploymentutil.RevisionAnnotation] = newRevision
-			glog.V(4).Infof("update existingNewRC %s revision to %s - %+v\n", existingNewRC.Name, newRevision)
-			return dc.client.Legacy().ReplicationControllers(deployment.ObjectMeta.Namespace).Update(existingNewRC)
+		// Set existing new RC's annotation
+		if setNewRCAnnotations(&deployment, existingNewRC, newRevision) {
+			return dc.client.Core().ReplicationControllers(deployment.ObjectMeta.Namespace).Update(existingNewRC)
 		}
 		return existingNewRC, nil
 	}
@@ -714,13 +704,11 @@ func (dc *DeploymentController) getNewRC(deployment extensions.Deployment, maxOl
 		return nil, fmt.Errorf("couldn't get key for deployment controller %#v: %v", deployment, err)
 	}
 	dc.rcExpectations.ExpectCreations(dKey, 1)
-
 	// Create new RC
 	newRC := api.ReplicationController{
 		ObjectMeta: api.ObjectMeta{
 			GenerateName: deployment.Name + "-",
 			Namespace:    namespace,
-			Annotations:  map[string]string{deploymentutil.RevisionAnnotation: newRevision},
 		},
 		Spec: api.ReplicationControllerSpec{
 			Replicas: 0,
@@ -728,7 +716,9 @@ func (dc *DeploymentController) getNewRC(deployment extensions.Deployment, maxOl
 			Template: &newRCTemplate,
 		},
 	}
-	createdRC, err := dc.client.Legacy().ReplicationControllers(namespace).Create(&newRC)
+	// Set new RC's annotation
+	setNewRCAnnotations(&deployment, &newRC, newRevision)
+	createdRC, err := dc.client.Core().ReplicationControllers(namespace).Create(&newRC)
 	if err != nil {
 		dc.rcExpectations.DeleteExpectations(dKey)
 		return nil, fmt.Errorf("error creating replication controller: %v", err)
@@ -738,21 +728,49 @@ func (dc *DeploymentController) getNewRC(deployment extensions.Deployment, maxOl
 	return createdRC, err
 }
 
+// setNewRCAnnotations sets new rc's annotations appropriately by updating its revision and
+// copying required deployment annotations to it; it returns true if rc's annotation is changed.
+func setNewRCAnnotations(deployment *extensions.Deployment, rc *api.ReplicationController, newRevision string) bool {
+	// First, copy deployment's annotations
+	annotationChanged := copyDeploymentAnnotationsToRC(deployment, rc)
+	// Then, update RC's revision annotation
+	if rc.Annotations == nil {
+		rc.Annotations = make(map[string]string)
+	}
+	if rc.Annotations[deploymentutil.RevisionAnnotation] != newRevision {
+		rc.Annotations[deploymentutil.RevisionAnnotation] = newRevision
+		annotationChanged = true
+		glog.V(4).Infof("updating RC %q's revision to %s - %+v\n", rc.Name, newRevision)
+	}
+	return annotationChanged
+}
+
+// copyDeploymentAnnotationsToRC copies deployment's annotations to rc's annotations,
+// and returns true if rc's annotation is changed
+func copyDeploymentAnnotationsToRC(deployment *extensions.Deployment, rc *api.ReplicationController) bool {
+	rcAnnotationsChanged := false
+	if rc.Annotations == nil {
+		rc.Annotations = make(map[string]string)
+	}
+	for k, v := range deployment.Annotations {
+		// Skip apply annotations
+		// TODO: How to decide which annotations should / should not be copied?
+		// See https://github.com/kubernetes/kubernetes/pull/20035#issuecomment-179558615
+		if k == kubectl.LastAppliedConfigAnnotation || rc.Annotations[k] == v {
+			continue
+		}
+		rc.Annotations[k] = v
+		rcAnnotationsChanged = true
+	}
+	return rcAnnotationsChanged
+}
+
 func (dc *DeploymentController) updateDeploymentRevision(deployment extensions.Deployment, revision string) error {
 	if deployment.Annotations == nil {
 		deployment.Annotations = make(map[string]string)
 	}
 	deployment.Annotations[deploymentutil.RevisionAnnotation] = revision
 	_, err := dc.updateDeployment(&deployment)
-	return err
-}
-
-func (dc *DeploymentController) updateRCRevision(rc api.ReplicationController, revision string) error {
-	if rc.Annotations == nil {
-		rc.Annotations = make(map[string]string)
-	}
-	rc.Annotations[deploymentutil.RevisionAnnotation] = revision
-	_, err := dc.client.Legacy().ReplicationControllers(rc.ObjectMeta.Namespace).Update(&rc)
 	return err
 }
 
@@ -806,7 +824,7 @@ func (dc *DeploymentController) reconcileOldRCs(allRCs []*api.ReplicationControl
 	}
 	// Check if we can scale down.
 	minAvailable := deployment.Spec.Replicas - maxUnavailable
-	minReadySeconds := deployment.Spec.Strategy.RollingUpdate.MinReadySeconds
+	minReadySeconds := deployment.Spec.MinReadySeconds
 	// Check the expectations of deployment before counting available pods
 	dKey, err := controller.KeyFunc(&deployment)
 	if err != nil {
@@ -901,7 +919,7 @@ func (dc *DeploymentController) cleanupOldRcs(oldRCs []*api.ReplicationControlle
 		if controller.Spec.Replicas != 0 || controller.Generation > controller.Status.ObservedGeneration {
 			continue
 		}
-		if err := dc.client.Legacy().ReplicationControllers(controller.Namespace).Delete(controller.Name, nil); err != nil && !errors.IsNotFound(err) {
+		if err := dc.client.Core().ReplicationControllers(controller.Namespace).Delete(controller.Name, nil); err != nil && !errors.IsNotFound(err) {
 			glog.V(2).Infof("Failed deleting old rc %v for deployment %v: %v", controller.Name, deployment.Name, err)
 			errList = append(errList, err)
 		}
@@ -930,10 +948,7 @@ func (dc *DeploymentController) updateDeploymentStatus(allRCs []*api.Replication
 func (dc *DeploymentController) calculateStatus(allRCs []*api.ReplicationController, newRC *api.ReplicationController, deployment extensions.Deployment) (totalReplicas, updatedReplicas, availableReplicas, unavailableReplicas int, err error) {
 	totalReplicas = deploymentutil.GetReplicaCountForRCs(allRCs)
 	updatedReplicas = deploymentutil.GetReplicaCountForRCs([]*api.ReplicationController{newRC})
-	minReadySeconds := 0
-	if deployment.Spec.Strategy.Type == extensions.RollingUpdateDeploymentStrategyType {
-		minReadySeconds = deployment.Spec.Strategy.RollingUpdate.MinReadySeconds
-	}
+	minReadySeconds := deployment.Spec.MinReadySeconds
 	availableReplicas, err = deploymentutil.GetAvailablePodsForRCs(dc.client, allRCs, minReadySeconds)
 	if err != nil {
 		err = fmt.Errorf("failed to count available pods: %v", err)
@@ -958,7 +973,7 @@ func (dc *DeploymentController) scaleRCAndRecordEvent(rc *api.ReplicationControl
 func (dc *DeploymentController) scaleRC(rc *api.ReplicationController, newScale int) (*api.ReplicationController, error) {
 	// TODO: Using client for now, update to use store when it is ready.
 	rc.Spec.Replicas = newScale
-	return dc.client.Legacy().ReplicationControllers(rc.ObjectMeta.Namespace).Update(rc)
+	return dc.client.Core().ReplicationControllers(rc.ObjectMeta.Namespace).Update(rc)
 }
 
 func (dc *DeploymentController) updateDeployment(deployment *extensions.Deployment) (*extensions.Deployment, error) {
@@ -973,7 +988,7 @@ func (dc *DeploymentController) rollbackToTemplate(deployment *extensions.Deploy
 		performedRollback = true
 	} else {
 		glog.V(4).Infof("Rolling back to a revision that contains the same template as current deployment %s, skipping rollback...", deployment.Name)
-		dc.emitRollbackWarningEvent(deployment, "DeploymentRollbackTemplateUnchanged", fmt.Sprintf("The rollback revision contains the same template as current deployment %q", deployment.Name))
+		dc.emitRollbackWarningEvent(deployment, deploymentutil.RollbackTemplateUnchanged, fmt.Sprintf("The rollback revision contains the same template as current deployment %q", deployment.Name))
 	}
 	d, err = dc.updateDeploymentAndClearRollbackTo(deployment)
 	return

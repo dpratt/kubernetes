@@ -27,7 +27,7 @@ import (
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/errors"
 	"k8s.io/kubernetes/pkg/client/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_2"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/client/record"
 	unversioned_core "k8s.io/kubernetes/pkg/client/typed/generated/core/unversioned"
 	"k8s.io/kubernetes/pkg/cloudprovider"
@@ -274,7 +274,7 @@ func (s *ServiceController) processDelta(delta *cache.Delta) (error, bool) {
 // Returns whatever error occurred along with a boolean indicator of whether it
 // should be retried.
 func (s *ServiceController) createLoadBalancerIfNeeded(namespacedName types.NamespacedName, service, appliedState *api.Service) (error, bool) {
-	if appliedState != nil && !needsUpdate(appliedState, service) {
+	if appliedState != nil && !s.needsUpdate(appliedState, service) {
 		glog.Infof("LB already exists and doesn't need update for service %s", namespacedName)
 		return nil, notRetryable
 	}
@@ -352,18 +352,20 @@ func (s *ServiceController) persistUpdate(service *api.Service) error {
 		// out so that we can process the delete, which we should soon be receiving
 		// if we haven't already.
 		if errors.IsNotFound(err) {
-			glog.Infof("Not persisting update to service that no longer exists: %v", err)
+			glog.Infof("Not persisting update to service '%s/%s' that no longer exists: %v",
+				service.Namespace, service.Name, err)
 			return nil
 		}
 		// TODO: Try to resolve the conflict if the change was unrelated to load
 		// balancer status. For now, just rely on the fact that we'll
 		// also process the update that caused the resource version to change.
 		if errors.IsConflict(err) {
-			glog.V(4).Infof("Not persisting update to service that has been changed since we received it: %v", err)
+			glog.V(4).Infof("Not persisting update to service '%s/%s' that has been changed since we received it: %v",
+				service.Namespace, service.Name, err)
 			return nil
 		}
-		glog.Warningf("Failed to persist updated LoadBalancerStatus to service %s after creating its load balancer: %v",
-			service.Name, err)
+		glog.Warningf("Failed to persist updated LoadBalancerStatus to service '%s/%s' after creating its load balancer: %v",
+			service.Namespace, service.Name, err)
 		time.Sleep(clientRetryInterval)
 	}
 	return err
@@ -457,24 +459,32 @@ func (s *serviceCache) delete(serviceName string) {
 	delete(s.serviceMap, serviceName)
 }
 
-func needsUpdate(oldService *api.Service, newService *api.Service) bool {
+func (s *ServiceController) needsUpdate(oldService *api.Service, newService *api.Service) bool {
 	if !wantsLoadBalancer(oldService) && !wantsLoadBalancer(newService) {
 		return false
 	}
 	if wantsLoadBalancer(oldService) != wantsLoadBalancer(newService) {
+		s.eventRecorder.Eventf(newService, api.EventTypeNormal, "Type", "%v -> %v",
+			oldService.Spec.Type, newService.Spec.Type)
 		return true
 	}
 	if !portsEqualForLB(oldService, newService) || oldService.Spec.SessionAffinity != newService.Spec.SessionAffinity {
 		return true
 	}
 	if !loadBalancerIPsAreEqual(oldService, newService) {
+		s.eventRecorder.Eventf(newService, api.EventTypeNormal, "LoadbalancerIP", "%v -> %v",
+			oldService.Spec.LoadBalancerIP, newService.Spec.LoadBalancerIP)
 		return true
 	}
 	if len(oldService.Spec.ExternalIPs) != len(newService.Spec.ExternalIPs) {
+		s.eventRecorder.Eventf(newService, api.EventTypeNormal, "ExternalIP", "Count: %v -> %v",
+			len(oldService.Spec.ExternalIPs), len(newService.Spec.ExternalIPs))
 		return true
 	}
 	for i := range oldService.Spec.ExternalIPs {
 		if oldService.Spec.ExternalIPs[i] != newService.Spec.ExternalIPs[i] {
+			s.eventRecorder.Eventf(newService, api.EventTypeNormal, "ExternalIP", "Added: %v",
+				newService.Spec.ExternalIPs[i])
 			return true
 		}
 	}

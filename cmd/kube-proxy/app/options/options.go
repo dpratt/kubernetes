@@ -22,8 +22,8 @@ import (
 	"time"
 
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/apis/componentconfig"
+	"k8s.io/kubernetes/pkg/apis/componentconfig/v1alpha1"
 	"k8s.io/kubernetes/pkg/kubelet/qos"
 	"k8s.io/kubernetes/pkg/util"
 
@@ -48,21 +48,13 @@ type ProxyServerConfig struct {
 }
 
 func NewProxyConfig() *ProxyServerConfig {
+	config := componentconfig.KubeProxyConfiguration{}
+	api.Scheme.Convert(&v1alpha1.KubeProxyConfiguration{}, &config)
 	return &ProxyServerConfig{
-		KubeProxyConfiguration: componentconfig.KubeProxyConfiguration{
-			BindAddress:                    "0.0.0.0",
-			HealthzPort:                    10249,
-			HealthzBindAddress:             "127.0.0.1",
-			OOMScoreAdj:                    util.IntPtr(qos.KubeProxyOOMScoreAdj),
-			ResourceContainer:              "/kube-proxy",
-			IPTablesSyncPeriod:             unversioned.Duration{30 * time.Second},
-			UDPIdleTimeout:                 unversioned.Duration{250 * time.Millisecond},
-			ConntrackMax:                   256 * 1024,                                     // 4x default (64k)
-			ConntrackTCPEstablishedTimeout: unversioned.Duration{Duration: 24 * time.Hour}, // 1 day (1/5 default)
-		},
-		KubeAPIQPS:       5.0,
-		KubeAPIBurst:     10,
-		ConfigSyncPeriod: 15 * time.Minute,
+		KubeProxyConfiguration: config,
+		KubeAPIQPS:             5.0,
+		KubeAPIBurst:           10,
+		ConfigSyncPeriod:       15 * time.Minute,
 	}
 }
 
@@ -81,8 +73,8 @@ func (s *ProxyServerConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.Var(&s.Mode, "proxy-mode", "Which proxy mode to use: 'userspace' (older) or 'iptables' (faster). If blank, look at the Node object on the Kubernetes API and respect the '"+ExperimentalProxyModeAnnotation+"' annotation if provided.  Otherwise use the best-available proxy (currently iptables).  If the iptables proxy is selected, regardless of how, but the system's kernel or iptables versions are insufficient, this always falls back to the userspace proxy.")
 	fs.DurationVar(&s.IPTablesSyncPeriod.Duration, "iptables-sync-period", s.IPTablesSyncPeriod.Duration, "How often iptables rules are refreshed (e.g. '5s', '1m', '2h22m').  Must be greater than 0.")
 	fs.DurationVar(&s.ConfigSyncPeriod, "config-sync-period", s.ConfigSyncPeriod, "How often configuration from the apiserver is refreshed.  Must be greater than 0.")
-	fs.BoolVar(&s.MasqueradeAll, "masquerade-all", false, "If using the pure iptables proxy, SNAT everything")
-	fs.BoolVar(&s.CleanupAndExit, "cleanup-iptables", false, "If true cleanup iptables rules and exit.")
+	fs.BoolVar(&s.MasqueradeAll, "masquerade-all", s.MasqueradeAll, "If using the pure iptables proxy, SNAT everything")
+	fs.BoolVar(&s.CleanupAndExit, "cleanup-iptables", s.CleanupAndExit, "If true cleanup iptables rules and exit.")
 	fs.Float32Var(&s.KubeAPIQPS, "kube-api-qps", s.KubeAPIQPS, "QPS to use while talking with kubernetes apiserver")
 	fs.IntVar(&s.KubeAPIBurst, "kube-api-burst", s.KubeAPIBurst, "Burst to use while talking with kubernetes apiserver")
 	fs.DurationVar(&s.UDPIdleTimeout.Duration, "udp-timeout", s.UDPIdleTimeout.Duration, "How long an idle UDP connection will be kept open (e.g. '250ms', '2s').  Must be greater than 0. Only applicable for proxy-mode=userspace")

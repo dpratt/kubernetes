@@ -59,6 +59,7 @@ import (
 	podetcd "k8s.io/kubernetes/pkg/registry/pod/etcd"
 	pspetcd "k8s.io/kubernetes/pkg/registry/podsecuritypolicy/etcd"
 	podtemplateetcd "k8s.io/kubernetes/pkg/registry/podtemplate/etcd"
+	replicasetetcd "k8s.io/kubernetes/pkg/registry/replicaset/etcd"
 	resourcequotaetcd "k8s.io/kubernetes/pkg/registry/resourcequota/etcd"
 	secretetcd "k8s.io/kubernetes/pkg/registry/secret/etcd"
 	"k8s.io/kubernetes/pkg/registry/service"
@@ -73,8 +74,8 @@ import (
 	"k8s.io/kubernetes/pkg/storage"
 	etcdmetrics "k8s.io/kubernetes/pkg/storage/etcd/metrics"
 	etcdutil "k8s.io/kubernetes/pkg/storage/etcd/util"
-	"k8s.io/kubernetes/pkg/util"
 	"k8s.io/kubernetes/pkg/util/sets"
+	"k8s.io/kubernetes/pkg/util/wait"
 
 	daemonetcd "k8s.io/kubernetes/pkg/registry/daemonset/etcd"
 	horizontalpodautoscaleretcd "k8s.io/kubernetes/pkg/registry/horizontalpodautoscaler/etcd"
@@ -573,7 +574,7 @@ func (m *Master) thirdpartyapi(group, kind, version string) *apiserver.APIGroupV
 // getExperimentalResources returns the resources for extenstions api
 func (m *Master) getExtensionResources(c *Config) map[string]rest.Storage {
 	// All resources except these are disabled by default.
-	enabledResources := sets.NewString("jobs", "horizontalpodautoscalers", "ingresses", "podsecuritypolicy")
+	enabledResources := sets.NewString("horizontalpodautoscalers", "ingresses", "jobs", "podsecuritypolicy", "replicasets")
 	resourceOverrides := m.ApiGroupVersionOverrides["extensions/v1beta1"].ResourceOverrides
 	isEnabled := func(resource string) bool {
 		// Check if the resource has been overriden.
@@ -604,7 +605,7 @@ func (m *Master) getExtensionResources(c *Config) map[string]rest.Storage {
 			thirdPartyResourceRegistry: thirdPartyResourceStorage,
 		}
 		go func() {
-			util.Forever(func() {
+			wait.Forever(func() {
 				if err := thirdPartyControl.SyncResources(); err != nil {
 					glog.Warningf("third party resource sync failed: %v", err)
 				}
@@ -639,6 +640,11 @@ func (m *Master) getExtensionResources(c *Config) map[string]rest.Storage {
 	if isEnabled("podsecuritypolicy") {
 		podSecurityPolicyStorage := pspetcd.NewREST(dbClient("podsecuritypolicy"), storageDecorator)
 		storage["podSecurityPolicies"] = podSecurityPolicyStorage
+	}
+	if isEnabled("replicasets") {
+		replicaSetStorage := replicasetetcd.NewStorage(dbClient("replicasets"), storageDecorator)
+		storage["replicasets"] = replicaSetStorage.ReplicaSet
+		storage["replicasets/status"] = replicaSetStorage.Status
 	}
 
 	return storage

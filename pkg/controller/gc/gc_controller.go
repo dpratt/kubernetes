@@ -23,14 +23,14 @@ import (
 
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/client/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_2"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/framework"
 	"k8s.io/kubernetes/pkg/fields"
 	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util"
 	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
+	"k8s.io/kubernetes/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/watch"
 
 	"github.com/golang/glog"
@@ -79,7 +79,7 @@ func New(kubeClient clientset.Interface, resyncPeriod controller.ResyncPeriodFun
 
 func (gcc *GCController) Run(stop <-chan struct{}) {
 	go gcc.podStoreSyncer.Run(stop)
-	go util.Until(gcc.gc, gcCheckPeriod, stop)
+	go wait.Until(gcc.gc, gcCheckPeriod, stop)
 	<-stop
 }
 

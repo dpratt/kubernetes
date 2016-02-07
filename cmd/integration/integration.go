@@ -38,7 +38,7 @@ import (
 	"k8s.io/kubernetes/pkg/api/testapi"
 	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/api/v1"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_2"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/client/record"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/controller"
@@ -191,11 +191,11 @@ func startComponents(firstManifestURL, secondManifestURL string) (string, string
 
 	// ensure the service endpoints are sync'd several times within the window that the integration tests wait
 	go endpointcontroller.NewEndpointController(clientset, controller.NoResyncPeriodFunc).
-		Run(3, util.NeverStop)
+		Run(3, wait.NeverStop)
 
 	// TODO: Write an integration test for the replication controllers watch.
 	go replicationcontroller.NewReplicationManager(clientset, controller.NoResyncPeriodFunc, replicationcontroller.BurstReplicas).
-		Run(3, util.NeverStop)
+		Run(3, wait.NeverStop)
 
 	nodeController := nodecontroller.NewNodeController(nil, clientset, 5*time.Minute, util.NewFakeRateLimiter(), util.NewFakeRateLimiter(),
 		40*time.Second, 60*time.Second, 5*time.Second, nil, false)

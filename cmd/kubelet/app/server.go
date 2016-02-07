@@ -38,7 +38,7 @@ import (
 	"k8s.io/kubernetes/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/capabilities"
 	"k8s.io/kubernetes/pkg/client/chaosclient"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_2"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/client/record"
 	unversioned_core "k8s.io/kubernetes/pkg/client/typed/generated/core/unversioned"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
@@ -63,6 +63,7 @@ import (
 	nodeutil "k8s.io/kubernetes/pkg/util/node"
 	"k8s.io/kubernetes/pkg/util/oom"
 	"k8s.io/kubernetes/pkg/util/runtime"
+	"k8s.io/kubernetes/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/volume"
 )
 
@@ -180,6 +181,7 @@ func UnsecuredKubeletConfig(s *options.KubeletServer) (*KubeletConfig, error) {
 		AllowPrivileged:           s.AllowPrivileged,
 		Auth:                      nil, // default does not enforce auth[nz]
 		CAdvisorInterface:         nil, // launches background processes, not set here
+		VolumeStatsAggPeriod:      s.VolumeStatsAggPeriod.Duration,
 		CgroupRoot:                s.CgroupRoot,
 		Cloud:                     nil, // cloud provider might start background processes
 		ClusterDNS:                net.ParseIP(s.ClusterDNS),
@@ -321,12 +323,12 @@ func Run(s *options.KubeletServer, kcfg *KubeletConfig) error {
 
 	if s.HealthzPort > 0 {
 		healthz.DefaultHealthz()
-		go util.Until(func() {
+		go wait.Until(func() {
 			err := http.ListenAndServe(net.JoinHostPort(s.HealthzBindAddress, strconv.Itoa(s.HealthzPort)), nil)
 			if err != nil {
 				glog.Errorf("Starting health server failed: %v", err)
 			}
-		}, 5*time.Second, util.NeverStop)
+		}, 5*time.Second, wait.NeverStop)
 	}
 
 	if s.RunOnce {
@@ -481,6 +483,7 @@ func SimpleKubelet(client *clientset.Clientset,
 	kcfg := KubeletConfig{
 		Address:                   net.ParseIP(address),
 		CAdvisorInterface:         cadvisorInterface,
+		VolumeStatsAggPeriod:      time.Minute,
 		CgroupRoot:                "",
 		Cloud:                     cloud,
 		ClusterDNS:                clusterDNS,
@@ -609,18 +612,18 @@ func RunKubelet(kcfg *KubeletConfig) error {
 
 func startKubelet(k KubeletBootstrap, podCfg *config.PodConfig, kc *KubeletConfig) {
 	// start the kubelet
-	go util.Until(func() { k.Run(podCfg.Updates()) }, 0, util.NeverStop)
+	go wait.Until(func() { k.Run(podCfg.Updates()) }, 0, wait.NeverStop)
 
 	// start the kubelet server
 	if kc.EnableServer {
-		go util.Until(func() {
+		go wait.Until(func() {
 			k.ListenAndServe(kc.Address, kc.Port, kc.TLSOptions, kc.Auth, kc.EnableDebuggingHandlers)
-		}, 0, util.NeverStop)
+		}, 0, wait.NeverStop)
 	}
 	if kc.ReadOnlyPort > 0 {
-		go util.Until(func() {
+		go wait.Until(func() {
 			k.ListenAndServeReadOnly(kc.Address, kc.ReadOnlyPort)
-		}, 0, util.NeverStop)
+		}, 0, wait.NeverStop)
 	}
 }
 
@@ -654,6 +657,7 @@ type KubeletConfig struct {
 	Auth                           server.AuthInterface
 	Builder                        KubeletBuilder
 	CAdvisorInterface              cadvisor.Interface
+	VolumeStatsAggPeriod           time.Duration
 	CgroupRoot                     string
 	Cloud                          cloudprovider.Interface
 	ClusterDNS                     net.IP
@@ -815,6 +819,7 @@ func CreateAndInitKubelet(kc *KubeletConfig) (k KubeletBootstrap, pc *config.Pod
 		kc.NodeIP,
 		kc.Reservation,
 		kc.EnableCustomMetrics,
+		kc.VolumeStatsAggPeriod,
 	)
 
 	if err != nil {

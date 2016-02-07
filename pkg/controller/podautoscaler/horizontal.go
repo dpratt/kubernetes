@@ -31,7 +31,7 @@ import (
 	unversioned_core "k8s.io/kubernetes/pkg/client/typed/generated/core/unversioned"
 	unversioned_extensions "k8s.io/kubernetes/pkg/client/typed/generated/extensions/unversioned"
 	"k8s.io/kubernetes/pkg/controller/podautoscaler/metrics"
-	"k8s.io/kubernetes/pkg/util"
+	"k8s.io/kubernetes/pkg/util/wait"
 )
 
 const (
@@ -39,8 +39,8 @@ const (
 	// TODO: make it a flag or HPA spec element.
 	tolerance = 0.1
 
-	HpaCustomMetricsDefinitionAnnotationName = "alpha/definiton.custom-metrics.podautoscaler.kubernetes.io"
-	HpaCustomMetricsStatusAnnotationName     = "alpha/status.custom-metrics.podautoscaler.kubernetes.io"
+	HpaCustomMetricsTargetAnnotationName = "alpha/target.custom-metrics.podautoscaler.kubernetes.io"
+	HpaCustomMetricsStatusAnnotationName = "alpha/status.custom-metrics.podautoscaler.kubernetes.io"
 )
 
 type HorizontalController struct {
@@ -68,11 +68,11 @@ func NewHorizontalController(evtNamespacer unversioned_core.EventsGetter, scaleN
 }
 
 func (a *HorizontalController) Run(syncPeriod time.Duration) {
-	go util.Until(func() {
+	go wait.Until(func() {
 		if err := a.reconcileAutoscalers(); err != nil {
 			glog.Errorf("Couldn't reconcile horizontal pod autoscalers: %v", err)
 		}
-	}, syncPeriod, util.NeverStop)
+	}, syncPeriod, wait.NeverStop)
 }
 
 func (a *HorizontalController) computeReplicasForCPUUtilization(hpa extensions.HorizontalPodAutoscaler, scale *extensions.Scale) (int, *int, time.Time, error) {
@@ -190,7 +190,7 @@ func (a *HorizontalController) reconcileAutoscaler(hpa extensions.HorizontalPodA
 		}
 	}
 
-	if cmAnnotation, cmAnnotationFound := hpa.Annotations[HpaCustomMetricsDefinitionAnnotationName]; cmAnnotationFound {
+	if cmAnnotation, cmAnnotationFound := hpa.Annotations[HpaCustomMetricsTargetAnnotationName]; cmAnnotationFound {
 		cmDesiredReplicas, cmStatus, cmTimestamp, err = a.computeReplicasForCustomMetrics(hpa, scale, cmAnnotation)
 		if err != nil {
 			a.eventRecorder.Event(&hpa, api.EventTypeWarning, "FailedComputeCMReplicas", err.Error())

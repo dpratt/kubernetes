@@ -29,7 +29,7 @@ import (
 	"k8s.io/kubernetes/pkg/api/errors"
 	"k8s.io/kubernetes/pkg/apis/extensions"
 	"k8s.io/kubernetes/pkg/client/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_2"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/client/record"
 	unversioned_core "k8s.io/kubernetes/pkg/client/typed/generated/core/unversioned"
 	"k8s.io/kubernetes/pkg/controller"
@@ -42,6 +42,7 @@ import (
 	labelsutil "k8s.io/kubernetes/pkg/util/labels"
 	podutil "k8s.io/kubernetes/pkg/util/pod"
 	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
+	"k8s.io/kubernetes/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/util/workqueue"
 	"k8s.io/kubernetes/pkg/watch"
 )
@@ -192,7 +193,7 @@ func (dc *DeploymentController) Run(workers int, stopCh <-chan struct{}) {
 	go dc.rcController.Run(stopCh)
 	go dc.podController.Run(stopCh)
 	for i := 0; i < workers; i++ {
-		go util.Until(dc.worker, time.Second, stopCh)
+		go wait.Until(dc.worker, time.Second, stopCh)
 	}
 	<-stopCh
 	glog.Infof("Shutting down deployment controller")
@@ -695,8 +696,8 @@ func (dc *DeploymentController) getNewRC(deployment extensions.Deployment, maxOl
 	namespace := deployment.ObjectMeta.Namespace
 	podTemplateSpecHash := podutil.GetPodTemplateSpecHash(deployment.Spec.Template)
 	newRCTemplate := deploymentutil.GetNewRCTemplate(deployment)
-	// Add podTemplateHash label to selector.
-	newRCSelector := labelsutil.CloneAndAddLabel(deployment.Spec.Selector, deployment.Spec.UniqueLabelKey, podTemplateSpecHash)
+	// Add pod-template-hash label to selector.
+	newRCSelector := labelsutil.CloneAndAddLabel(deployment.Spec.Selector, extensions.DefaultDeploymentUniqueLabelKey, podTemplateSpecHash)
 
 	// Set RC expectations (1 rc should be created)
 	dKey, err = controller.KeyFunc(&deployment)

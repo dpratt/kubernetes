@@ -279,7 +279,7 @@ func ValidateObjectMeta(meta *api.ObjectMeta, requiresNamespace bool, nameFn Val
 		}
 	} else {
 		if len(meta.Namespace) != 0 {
-			allErrs = append(allErrs, field.Forbidden(fldPath, "not allowed on this type"))
+			allErrs = append(allErrs, field.Forbidden(fldPath.Child("namespace"), "not allowed on this type"))
 		}
 	}
 	allErrs = append(allErrs, ValidateNonnegativeField(meta.Generation, fldPath.Child("generation"))...)
@@ -1485,17 +1485,56 @@ func ValidatePodUpdate(newPod, oldPod *api.Pod) field.ErrorList {
 		allErrs = append(allErrs, field.Forbidden(specPath.Child("containers"), "pod updates may not add or remove containers"))
 		return allErrs
 	}
-	pod := *newPod
-	// Tricky, we need to copy the container list so that we don't overwrite the update
+
+	// validate updateable fields:
+	// 1.  containers[*].image
+	// 2.  spec.activeDeadlineSeconds
+
+	// validate updated container images
+	for i, ctr := range newPod.Spec.Containers {
+		if len(ctr.Image) == 0 {
+			allErrs = append(allErrs, field.Required(specPath.Child("containers").Index(i).Child("image"), ""))
+		}
+	}
+
+	// validate updated spec.activeDeadlineSeconds.  two types of updates are allowed:
+	// 1.  from nil to a positive value
+	// 2.  from a positive value to a lesser, non-negative value
+	if newPod.Spec.ActiveDeadlineSeconds != nil {
+		newActiveDeadlineSeconds := *newPod.Spec.ActiveDeadlineSeconds
+		if newActiveDeadlineSeconds < 0 {
+			allErrs = append(allErrs, field.Invalid(specPath.Child("activeDeadlineSeconds"), newActiveDeadlineSeconds, isNegativeErrorMsg))
+			return allErrs
+		}
+		if oldPod.Spec.ActiveDeadlineSeconds != nil {
+			oldActiveDeadlineSeconds := *oldPod.Spec.ActiveDeadlineSeconds
+			if oldActiveDeadlineSeconds < newActiveDeadlineSeconds {
+				allErrs = append(allErrs, field.Invalid(specPath.Child("activeDeadlineSeconds"), newActiveDeadlineSeconds, "must be less than or equal to previous value"))
+				return allErrs
+			}
+		}
+	} else if oldPod.Spec.ActiveDeadlineSeconds != nil {
+		allErrs = append(allErrs, field.Invalid(specPath.Child("activeDeadlineSeconds"), newPod.Spec.ActiveDeadlineSeconds, "must not update from a positive integer to nil value"))
+	}
+
+	// handle updateable fields by munging those fields prior to deep equal comparison.
+	mungedPod := *newPod
+	// munge containers[*].image
 	var newContainers []api.Container
-	for ix, container := range pod.Spec.Containers {
+	for ix, container := range mungedPod.Spec.Containers {
 		container.Image = oldPod.Spec.Containers[ix].Image
 		newContainers = append(newContainers, container)
 	}
-	pod.Spec.Containers = newContainers
-	if !api.Semantic.DeepEqual(pod.Spec, oldPod.Spec) {
+	mungedPod.Spec.Containers = newContainers
+	// munge spec.activeDeadlineSeconds
+	mungedPod.Spec.ActiveDeadlineSeconds = nil
+	if oldPod.Spec.ActiveDeadlineSeconds != nil {
+		activeDeadlineSeconds := *oldPod.Spec.ActiveDeadlineSeconds
+		mungedPod.Spec.ActiveDeadlineSeconds = &activeDeadlineSeconds
+	}
+	if !api.Semantic.DeepEqual(mungedPod.Spec, oldPod.Spec) {
 		//TODO: Pinpoint the specific field that causes the invalid error after we have strategic merge diff
-		allErrs = append(allErrs, field.Forbidden(specPath, "pod updates may not change fields other than `containers[*].image`"))
+		allErrs = append(allErrs, field.Forbidden(specPath, "pod updates may not change fields other than `containers[*].image` or `spec.activeDeadlineSeconds`"))
 	}
 
 	return allErrs
@@ -1614,11 +1653,17 @@ func ValidateService(service *api.Service) field.ErrorList {
 
 	if service.Spec.Type == api.ServiceTypeLoadBalancer {
 		portsPath := specPath.Child("ports")
+		includeProtocols := sets.NewString()
 		for i := range service.Spec.Ports {
 			portPath := portsPath.Index(i)
 			if !supportedPortProtocols.Has(string(service.Spec.Ports[i].Protocol)) {
 				allErrs = append(allErrs, field.Invalid(portPath.Child("protocol"), service.Spec.Ports[i].Protocol, "cannot create an external load balancer with non-TCP/UDP ports"))
+			} else {
+				includeProtocols.Insert(string(service.Spec.Ports[i].Protocol))
 			}
+		}
+		if includeProtocols.Len() > 1 {
+			allErrs = append(allErrs, field.Invalid(portsPath, service.Spec.Ports, "cannot create an external load balancer with mix protocols"))
 		}
 	}
 
@@ -2083,6 +2128,14 @@ func ValidateSecret(secret *api.Secret) field.ErrorList {
 			break
 		}
 
+	case api.SecretTypeTLS:
+		if _, exists := secret.Data[api.TLSCertKey]; !exists {
+			allErrs = append(allErrs, field.Required(dataPath.Key(api.TLSCertKey), ""))
+		}
+		if _, exists := secret.Data[api.TLSPrivateKeyKey]; !exists {
+			allErrs = append(allErrs, field.Required(dataPath.Key(api.TLSPrivateKeyKey), ""))
+		}
+		// TODO: Verify that the key matches the cert.
 	default:
 		// no-op
 	}

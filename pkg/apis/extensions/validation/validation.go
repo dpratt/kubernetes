@@ -17,6 +17,7 @@ limitations under the License.
 package validation
 
 import (
+	"encoding/json"
 	"net"
 	"regexp"
 	"strconv"
@@ -27,6 +28,7 @@ import (
 	unversionedvalidation "k8s.io/kubernetes/pkg/api/unversioned/validation"
 	apivalidation "k8s.io/kubernetes/pkg/api/validation"
 	"k8s.io/kubernetes/pkg/apis/extensions"
+	"k8s.io/kubernetes/pkg/controller/podautoscaler"
 	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/util/intstr"
 	"k8s.io/kubernetes/pkg/util/sets"
@@ -85,9 +87,34 @@ func ValidateSubresourceReference(ref extensions.SubresourceReference, fldPath *
 	return allErrs
 }
 
+func validateHorizontalPodAutoscalerAnnotations(annotations map[string]string, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if annotationValue, found := annotations[podautoscaler.HpaCustomMetricsTargetAnnotationName]; found {
+		// Try to parse the annotation
+		var targetList extensions.CustomMetricTargetList
+		if err := json.Unmarshal([]byte(annotationValue), &targetList); err != nil {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("annotations"), annotations, "failed to parse custom metrics target annotation"))
+		} else {
+			if len(targetList.Items) == 0 {
+				allErrs = append(allErrs, field.Required(fldPath.Child("annotations", "items"), "custom metrics target must not be empty"))
+			}
+			for _, target := range targetList.Items {
+				if target.Name == "" {
+					allErrs = append(allErrs, field.Required(fldPath.Child("annotations", "items", "name"), "missing custom metric target name"))
+				}
+				if target.TargetValue.MilliValue() <= 0 {
+					allErrs = append(allErrs, field.Invalid(fldPath.Child("annotations", "items", "value"), target.TargetValue, "custom metric target value must be greater than 0"))
+				}
+			}
+		}
+	}
+	return allErrs
+}
+
 func ValidateHorizontalPodAutoscaler(autoscaler *extensions.HorizontalPodAutoscaler) field.ErrorList {
 	allErrs := apivalidation.ValidateObjectMeta(&autoscaler.ObjectMeta, true, ValidateHorizontalPodAutoscalerName, field.NewPath("metadata"))
 	allErrs = append(allErrs, validateHorizontalPodAutoscalerSpec(autoscaler.Spec, field.NewPath("spec"))...)
+	allErrs = append(allErrs, validateHorizontalPodAutoscalerAnnotations(autoscaler.Annotations, field.NewPath("metadata"))...)
 	return allErrs
 }
 
@@ -328,10 +355,6 @@ func ValidateDeploymentSpec(spec *extensions.DeploymentSpec, fldPath *field.Path
 		// zero is a valid RevisionHistoryLimit
 		allErrs = append(allErrs, apivalidation.ValidateNonnegativeField(int64(*spec.RevisionHistoryLimit), fldPath.Child("revisionHistoryLimit"))...)
 	}
-	// empty string is a valid UniqueLabelKey
-	if len(spec.UniqueLabelKey) > 0 {
-		allErrs = append(allErrs, apivalidation.ValidateLabelName(spec.UniqueLabelKey, fldPath.Child("uniqueLabel"))...)
-	}
 	if spec.RollbackTo != nil {
 		allErrs = append(allErrs, ValidateRollback(spec.RollbackTo, fldPath.Child("rollback"))...)
 	}
@@ -459,6 +482,20 @@ func ValidateIngressName(name string, prefix bool) (bool, string) {
 	return apivalidation.NameIsDNSSubdomain(name, prefix)
 }
 
+func validateIngressTLS(spec *extensions.IngressSpec, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	// Currently the Ingress only supports HTTP(S), so a secretName is required.
+	// This will not be the case if we support SSL routing at L4 via SNI.
+	for i, t := range spec.TLS {
+		if t.SecretName == "" {
+			allErrs = append(allErrs, field.Required(fldPath.Index(i).Child("secretName"), spec.TLS[i].SecretName))
+		}
+	}
+	// TODO: Perform a more thorough validation of spec.TLS.Hosts that takes
+	// the wildcard spec from RFC 6125 into account.
+	return allErrs
+}
+
 // ValidateIngressSpec tests if required fields in the IngressSpec are set.
 func ValidateIngressSpec(spec *extensions.IngressSpec, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
@@ -470,6 +507,9 @@ func ValidateIngressSpec(spec *extensions.IngressSpec, fldPath *field.Path) fiel
 	}
 	if len(spec.Rules) > 0 {
 		allErrs = append(allErrs, validateIngressRules(spec.Rules, fldPath.Child("rules"))...)
+	}
+	if len(spec.TLS) > 0 {
+		allErrs = append(allErrs, validateIngressTLS(spec, fldPath.Child("tls"))...)
 	}
 	return allErrs
 }

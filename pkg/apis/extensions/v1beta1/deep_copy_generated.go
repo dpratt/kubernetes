@@ -1190,12 +1190,6 @@ func deepCopy_v1beta1_DeploymentSpec(in DeploymentSpec, out *DeploymentSpec, c *
 	} else {
 		out.RevisionHistoryLimit = nil
 	}
-	if in.UniqueLabelKey != nil {
-		out.UniqueLabelKey = new(string)
-		*out.UniqueLabelKey = *in.UniqueLabelKey
-	} else {
-		out.UniqueLabelKey = nil
-	}
 	out.Paused = in.Paused
 	if in.RollbackTo != nil {
 		out.RollbackTo = new(RollbackConfig)
@@ -1420,6 +1414,16 @@ func deepCopy_v1beta1_IngressSpec(in IngressSpec, out *IngressSpec, c *conversio
 	} else {
 		out.Backend = nil
 	}
+	if in.TLS != nil {
+		out.TLS = make([]IngressTLS, len(in.TLS))
+		for i := range in.TLS {
+			if err := deepCopy_v1beta1_IngressTLS(in.TLS[i], &out.TLS[i], c); err != nil {
+				return err
+			}
+		}
+	} else {
+		out.TLS = nil
+	}
 	if in.Rules != nil {
 		out.Rules = make([]IngressRule, len(in.Rules))
 		for i := range in.Rules {
@@ -1437,6 +1441,19 @@ func deepCopy_v1beta1_IngressStatus(in IngressStatus, out *IngressStatus, c *con
 	if err := deepCopy_v1_LoadBalancerStatus(in.LoadBalancer, &out.LoadBalancer, c); err != nil {
 		return err
 	}
+	return nil
+}
+
+func deepCopy_v1beta1_IngressTLS(in IngressTLS, out *IngressTLS, c *conversion.Cloner) error {
+	if in.Hosts != nil {
+		out.Hosts = make([]string, len(in.Hosts))
+		for i := range in.Hosts {
+			out.Hosts[i] = in.Hosts[i]
+		}
+	} else {
+		out.Hosts = nil
+	}
+	out.SecretName = in.SecretName
 	return nil
 }
 
@@ -2040,6 +2057,7 @@ func init() {
 		deepCopy_v1beta1_IngressRuleValue,
 		deepCopy_v1beta1_IngressSpec,
 		deepCopy_v1beta1_IngressStatus,
+		deepCopy_v1beta1_IngressTLS,
 		deepCopy_v1beta1_Job,
 		deepCopy_v1beta1_JobCondition,
 		deepCopy_v1beta1_JobList,

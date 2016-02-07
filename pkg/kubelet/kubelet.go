@@ -41,7 +41,7 @@ import (
 	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/api/validation"
 	"k8s.io/kubernetes/pkg/client/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/release_1_2"
+	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/client/record"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
 	"k8s.io/kubernetes/pkg/cloudprovider"
@@ -60,6 +60,7 @@ import (
 	proberesults "k8s.io/kubernetes/pkg/kubelet/prober/results"
 	"k8s.io/kubernetes/pkg/kubelet/rkt"
 	"k8s.io/kubernetes/pkg/kubelet/server"
+	"k8s.io/kubernetes/pkg/kubelet/server/stats"
 	"k8s.io/kubernetes/pkg/kubelet/status"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
@@ -81,6 +82,7 @@ import (
 	"k8s.io/kubernetes/pkg/util/selinux"
 	"k8s.io/kubernetes/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/util/validation/field"
+	"k8s.io/kubernetes/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/version"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/watch"
@@ -203,6 +205,7 @@ func NewMainKubelet(
 	nodeIP net.IP,
 	reservation kubetypes.Reservation,
 	enableCustomMetrics bool,
+	volumeStatsAggPeriod time.Duration,
 ) (*Kubelet, error) {
 	if rootDirectory == "" {
 		return nil, fmt.Errorf("invalid root directory %q", rootDirectory)
@@ -329,6 +332,9 @@ func NewMainKubelet(
 		reservation:                  reservation,
 		enableCustomMetrics:          enableCustomMetrics,
 	}
+	// TODO: Factor out "StatsProvider" from Kubelet so we don't have a cyclic dependency
+	klet.resourceAnalyzer = stats.NewResourceAnalyzer(klet, volumeStatsAggPeriod)
+
 	if klet.flannelExperimentalOverlay {
 		glog.Infof("Flannel is in charge of podCIDR and overlay networking.")
 	}
@@ -610,6 +616,9 @@ type Kubelet struct {
 	// Watcher of out of memory events.
 	oomWatcher OOMWatcher
 
+	// Monitor resource usage
+	resourceAnalyzer stats.ResourceAnalyzer
+
 	// If non-empty, pass this to the container runtime as the root cgroup.
 	cgroupRoot string
 
@@ -882,38 +891,23 @@ func (kl *Kubelet) GetNode() (*api.Node, error) {
 
 // Starts garbage collection threads.
 func (kl *Kubelet) StartGarbageCollection() {
-	go util.Until(func() {
+	go wait.Until(func() {
 		if err := kl.containerGC.GarbageCollect(); err != nil {
 			glog.Errorf("Container garbage collection failed: %v", err)
 		}
-	}, time.Minute, util.NeverStop)
+	}, time.Minute, wait.NeverStop)
 
-	go util.Until(func() {
+	go wait.Until(func() {
 		if err := kl.imageManager.GarbageCollect(); err != nil {
 			glog.Errorf("Image garbage collection failed: %v", err)
 		}
-	}, 5*time.Minute, util.NeverStop)
+	}, 5*time.Minute, wait.NeverStop)
 }
 
 // initializeModules will initialize internal modules that do not require the container runtime to be up.
 // Note that the modules here must not depend on modules that are not initialized here.
 func (kl *Kubelet) initializeModules() error {
-	// Promethues metrics.
-	metrics.Register(kl.runtimeCache)
-
-	// Step 1: Setup filesystem directories.
-	if err := kl.setupDataDirs(); err != nil {
-		return err
-	}
-
-	// Step 2: If the container logs directory does not exist, create it.
-	if _, err := os.Stat(containerLogsDir); err != nil {
-		if err := kl.os.Mkdir(containerLogsDir, 0755); err != nil {
-			glog.Errorf("Failed to create directory %q: %v", containerLogsDir, err)
-		}
-	}
-
-	// Step 3: Move Kubelet to a container, if required.
+	// Step 1: Move Kubelet to a container, if required.
 	if kl.resourceContainer != "" {
 		// Fixme: I need to reside inside ContainerManager interface.
 		err := util.RunInResourceContainer(kl.resourceContainer)
@@ -923,20 +917,38 @@ func (kl *Kubelet) initializeModules() error {
 		glog.Infof("Running in container %q", kl.resourceContainer)
 	}
 
-	// Step 4: Start the image manager.
+	// Step 2: Promethues metrics.
+	metrics.Register(kl.runtimeCache)
+
+	// Step 3: Setup filesystem directories.
+	if err := kl.setupDataDirs(); err != nil {
+		return err
+	}
+
+	// Step 4: If the container logs directory does not exist, create it.
+	if _, err := os.Stat(containerLogsDir); err != nil {
+		if err := kl.os.Mkdir(containerLogsDir, 0755); err != nil {
+			glog.Errorf("Failed to create directory %q: %v", containerLogsDir, err)
+		}
+	}
+
+	// Step 5: Start the image manager.
 	if err := kl.imageManager.Start(); err != nil {
 		return fmt.Errorf("Failed to start ImageManager, images may not be garbage collected: %v", err)
 	}
 
-	// Step 5: Start container manager.
+	// Step 6: Start container manager.
 	if err := kl.containerManager.Start(kl.nodeConfig); err != nil {
 		return fmt.Errorf("Failed to start ContainerManager %v", err)
 	}
 
-	// Step 6: Start out of memory watcher.
+	// Step 7: Start out of memory watcher.
 	if err := kl.oomWatcher.Start(kl.nodeRef); err != nil {
 		return fmt.Errorf("Failed to start OOM watcher %v", err)
 	}
+
+	// Step 7: Start resource analyzer
+	kl.resourceAnalyzer.Start()
 	return nil
 }
 
@@ -963,14 +975,14 @@ func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
 
 	if kl.kubeClient != nil {
 		// Start syncing node status immediately, this may set up things the runtime needs to run.
-		go util.Until(kl.syncNodeStatus, kl.nodeStatusUpdateFrequency, util.NeverStop)
+		go wait.Until(kl.syncNodeStatus, kl.nodeStatusUpdateFrequency, wait.NeverStop)
 	}
-	go util.Until(kl.syncNetworkStatus, 30*time.Second, util.NeverStop)
-	go util.Until(kl.updateRuntimeUp, 5*time.Second, util.NeverStop)
+	go wait.Until(kl.syncNetworkStatus, 30*time.Second, wait.NeverStop)
+	go wait.Until(kl.updateRuntimeUp, 5*time.Second, wait.NeverStop)
 
 	// Start a goroutine responsible for killing pods (that are not properly
 	// handled by pod workers).
-	go util.Until(kl.podKiller, 1*time.Second, util.NeverStop)
+	go wait.Until(kl.podKiller, 1*time.Second, wait.NeverStop)
 
 	// Start component sync loops.
 	kl.statusManager.Start()
@@ -3459,11 +3471,11 @@ func (kl *Kubelet) GetCachedMachineInfo() (*cadvisorapi.MachineInfo, error) {
 }
 
 func (kl *Kubelet) ListenAndServe(address net.IP, port uint, tlsOptions *server.TLSOptions, auth server.AuthInterface, enableDebuggingHandlers bool) {
-	server.ListenAndServeKubeletServer(kl, address, port, tlsOptions, auth, enableDebuggingHandlers)
+	server.ListenAndServeKubeletServer(kl, kl.resourceAnalyzer, address, port, tlsOptions, auth, enableDebuggingHandlers)
 }
 
 func (kl *Kubelet) ListenAndServeReadOnly(address net.IP, port uint) {
-	server.ListenAndServeKubeletReadOnlyServer(kl, address, port)
+	server.ListenAndServeKubeletReadOnlyServer(kl, kl.resourceAnalyzer, address, port)
 }
 
 // GetRuntime returns the current Runtime implementation in use by the kubelet. This func

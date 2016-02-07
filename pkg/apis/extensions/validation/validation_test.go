@@ -24,6 +24,7 @@ import (
 	"k8s.io/kubernetes/pkg/api"
 	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/apis/extensions"
+	"k8s.io/kubernetes/pkg/controller/podautoscaler"
 	"k8s.io/kubernetes/pkg/util/intstr"
 )
 
@@ -49,6 +50,24 @@ func TestValidateHorizontalPodAutoscaler(t *testing.T) {
 			ObjectMeta: api.ObjectMeta{
 				Name:      "myautoscaler",
 				Namespace: api.NamespaceDefault,
+			},
+			Spec: extensions.HorizontalPodAutoscalerSpec{
+				ScaleRef: extensions.SubresourceReference{
+					Kind:        "ReplicationController",
+					Name:        "myrc",
+					Subresource: "scale",
+				},
+				MinReplicas: newInt(1),
+				MaxReplicas: 5,
+			},
+		},
+		{
+			ObjectMeta: api.ObjectMeta{
+				Name:      "myautoscaler",
+				Namespace: api.NamespaceDefault,
+				Annotations: map[string]string{
+					podautoscaler.HpaCustomMetricsTargetAnnotationName: "{\"items\":[{\"name\":\"qps\",\"value\":\"20\"}]}",
+				},
 			},
 			Spec: extensions.HorizontalPodAutoscalerSpec{
 				ScaleRef: extensions.SubresourceReference{
@@ -203,6 +222,90 @@ func TestValidateHorizontalPodAutoscaler(t *testing.T) {
 				},
 			},
 			msg: "must be greater than 0",
+		},
+		{
+			horizontalPodAutoscaler: extensions.HorizontalPodAutoscaler{
+				ObjectMeta: api.ObjectMeta{
+					Name:      "myautoscaler",
+					Namespace: api.NamespaceDefault,
+					Annotations: map[string]string{
+						podautoscaler.HpaCustomMetricsTargetAnnotationName: "broken",
+					},
+				},
+				Spec: extensions.HorizontalPodAutoscalerSpec{
+					ScaleRef: extensions.SubresourceReference{
+						Kind:        "ReplicationController",
+						Name:        "myrc",
+						Subresource: "scale",
+					},
+					MinReplicas: newInt(1),
+					MaxReplicas: 5,
+				},
+			},
+			msg: "failed to parse custom metrics target annotation",
+		},
+		{
+			horizontalPodAutoscaler: extensions.HorizontalPodAutoscaler{
+				ObjectMeta: api.ObjectMeta{
+					Name:      "myautoscaler",
+					Namespace: api.NamespaceDefault,
+					Annotations: map[string]string{
+						podautoscaler.HpaCustomMetricsTargetAnnotationName: "{}",
+					},
+				},
+				Spec: extensions.HorizontalPodAutoscalerSpec{
+					ScaleRef: extensions.SubresourceReference{
+						Kind:        "ReplicationController",
+						Name:        "myrc",
+						Subresource: "scale",
+					},
+					MinReplicas: newInt(1),
+					MaxReplicas: 5,
+				},
+			},
+			msg: "custom metrics target must not be empty",
+		},
+		{
+			horizontalPodAutoscaler: extensions.HorizontalPodAutoscaler{
+				ObjectMeta: api.ObjectMeta{
+					Name:      "myautoscaler",
+					Namespace: api.NamespaceDefault,
+					Annotations: map[string]string{
+						podautoscaler.HpaCustomMetricsTargetAnnotationName: "{\"items\":[{\"value\":\"20\"}]}",
+					},
+				},
+				Spec: extensions.HorizontalPodAutoscalerSpec{
+					ScaleRef: extensions.SubresourceReference{
+						Kind:        "ReplicationController",
+						Name:        "myrc",
+						Subresource: "scale",
+					},
+					MinReplicas: newInt(1),
+					MaxReplicas: 5,
+				},
+			},
+			msg: "missing custom metric target name",
+		},
+		{
+			horizontalPodAutoscaler: extensions.HorizontalPodAutoscaler{
+				ObjectMeta: api.ObjectMeta{
+					Name:      "myautoscaler",
+					Namespace: api.NamespaceDefault,
+					Annotations: map[string]string{
+						podautoscaler.HpaCustomMetricsTargetAnnotationName: "{\"items\":[{\"name\":\"qps\",\"value\":\"0\"}]}",
+					},
+				},
+				Spec: extensions.HorizontalPodAutoscalerSpec{
+					ScaleRef: extensions.SubresourceReference{
+						Kind:        "ReplicationController",
+						Name:        "myrc",
+						Subresource: "scale",
+					},
+					MinReplicas: newInt(1),
+					MaxReplicas: 5,
+				},
+			},
+			msg: "custom metric target value must be greater than 0",
 		},
 	}
 
@@ -872,7 +975,6 @@ func validDeployment() *extensions.Deployment {
 					},
 				},
 			},
-			UniqueLabelKey: "my-label",
 			RollbackTo: &extensions.RollbackConfig{
 				Revision: 1,
 			},
@@ -907,11 +1009,6 @@ func TestValidateDeployment(t *testing.T) {
 	invalidRestartPolicyDeployment := validDeployment()
 	invalidRestartPolicyDeployment.Spec.Template.Spec.RestartPolicy = api.RestartPolicyNever
 	errorCases["Unsupported value: \"Never\""] = invalidRestartPolicyDeployment
-
-	// invalid unique label key.
-	invalidUniqueLabelDeployment := validDeployment()
-	invalidUniqueLabelDeployment.Spec.UniqueLabelKey = "abc/def/ghi"
-	errorCases["spec.uniqueLabel: Invalid value"] = invalidUniqueLabelDeployment
 
 	// rollingUpdate should be nil for recreate.
 	invalidRecreateDeployment := validDeployment()
@@ -1211,6 +1308,8 @@ func TestValidateIngress(t *testing.T) {
 	badHostIP := newValid()
 	badHostIP.Spec.Rules[0].Host = hostIP
 	badHostIPErr := fmt.Sprintf("spec.rules[0].host: Invalid value: '%v'", hostIP)
+	noSecretName := newValid()
+	noSecretName.Spec.TLS = []extensions.IngressTLS{{SecretName: ""}}
 
 	errorCases := map[string]extensions.Ingress{
 		"spec.backend.serviceName: Required value":        servicelessBackend,
@@ -1219,6 +1318,7 @@ func TestValidateIngress(t *testing.T) {
 		"spec.rules[0].host: Invalid value":               badHost,
 		"spec.rules[0].http.paths: Required value":        noPaths,
 		"spec.rules[0].http.paths[0].path: Invalid value": noForwardSlashPath,
+		"spec.tls[0].secretName: Required value":          noSecretName,
 	}
 	errorCases[badPathErr] = badRegexPath
 	errorCases[badHostIPErr] = badHostIP

@@ -461,7 +461,7 @@ var _ = Describe("Services", func() {
 
 		// Change the services to NodePort.
 
-		By("changing the TCP service " + serviceName + " to type=NodePort")
+		By("changing the TCP service to type=NodePort")
 		tcpService = jig.UpdateServiceOrFail(ns1, tcpService.Name, func(s *api.Service) {
 			s.Spec.Type = api.ServiceTypeNodePort
 		})
@@ -469,7 +469,7 @@ var _ = Describe("Services", func() {
 		tcpNodePort := tcpService.Spec.Ports[0].NodePort
 		Logf("TCP node port: %d", tcpNodePort)
 
-		By("changing the UDP service " + serviceName + " to type=NodePort")
+		By("changing the UDP service to type=NodePort")
 		udpService = jig.UpdateServiceOrFail(ns2, udpService.Name, func(s *api.Service) {
 			s.Spec.Type = api.ServiceTypeNodePort
 		})
@@ -486,31 +486,36 @@ var _ = Describe("Services", func() {
 		// Change the services to LoadBalancer.
 
 		requestedIP := ""
+		staticIPName := ""
 		if providerIs("gce", "gke") {
 			By("creating a static load balancer IP")
 			rand.Seed(time.Now().UTC().UnixNano())
-			staticIPName := fmt.Sprintf("e2e-external-lb-test-%d", rand.Intn(65535))
+			staticIPName = fmt.Sprintf("e2e-external-lb-test-%d", rand.Intn(65535))
 			requestedIP, err = createGCEStaticIP(staticIPName)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() {
-				// Release GCE static IP - this is not kube-managed and will not be automatically released.
-				deleteGCEStaticIP(staticIPName)
+				if staticIPName != "" {
+					// Release GCE static IP - this is not kube-managed and will not be automatically released.
+					if err := deleteGCEStaticIP(staticIPName); err != nil {
+						Logf("failed to release static IP %s: %v", staticIPName, err)
+					}
+				}
 			}()
 			Logf("Allocated static load balancer IP: %s", requestedIP)
 		}
 
-		By("changing the TCP service " + serviceName + " to type=LoadBalancer")
+		By("changing the TCP service to type=LoadBalancer")
 		tcpService = jig.UpdateServiceOrFail(ns1, tcpService.Name, func(s *api.Service) {
 			s.Spec.LoadBalancerIP = requestedIP // will be "" if not applicable
 			s.Spec.Type = api.ServiceTypeLoadBalancer
 		})
 
-		By("changing the UDP service " + serviceName + " to type=LoadBalancer")
+		By("changing the UDP service to type=LoadBalancer")
 		udpService = jig.UpdateServiceOrFail(ns2, udpService.Name, func(s *api.Service) {
 			s.Spec.Type = api.ServiceTypeLoadBalancer
 		})
 
-		By("waiting for the TCP service " + serviceName + " to have a load balancer")
+		By("waiting for the TCP service to have a load balancer")
 		// Wait for the load balancer to be created asynchronously
 		tcpService = jig.WaitForLoadBalancerOrFail(ns1, tcpService.Name)
 		jig.SanityCheckService(tcpService, api.ServiceTypeLoadBalancer)
@@ -524,6 +529,23 @@ var _ = Describe("Services", func() {
 		Logf("TCP load balancer: %s", tcpIngressIP)
 
 		By("waiting for the UDP service " + serviceName + " to have a load balancer")
+		if providerIs("gce", "gke") {
+			// Do this as early as possible, which overrides the `defer` above.
+			// This is mostly out of fear of leaking the IP in a timeout case
+			// (as of this writing we're not 100% sure where the leaks are
+			// coming from, so this is first-aid rather than surgery).
+			By("demoting the static IP to ephemeral")
+			if staticIPName != "" {
+				// Deleting it after it is attached "demotes" it to an
+				// ephemeral IP, which can be auto-released.
+				if err := deleteGCEStaticIP(staticIPName); err != nil {
+					Failf("failed to release static IP %s: %v", staticIPName, err)
+				}
+				staticIPName = ""
+			}
+		}
+
+		By("waiting for the UDP service to have a load balancer")
 		// 2nd one should be faster since they ran in parallel.
 		udpService = jig.WaitForLoadBalancerOrFail(ns2, udpService.Name)
 		jig.SanityCheckService(udpService, api.ServiceTypeLoadBalancer)
@@ -531,7 +553,7 @@ var _ = Describe("Services", func() {
 			Failf("UDP Spec.Ports[0].NodePort changed (%d -> %d) when not expected", udpNodePort, udpService.Spec.Ports[0].NodePort)
 		}
 		udpIngressIP := getIngressPoint(&udpService.Status.LoadBalancer.Ingress[0])
-		Logf("UDP load balancer: %s", tcpIngressIP)
+		Logf("UDP load balancer: %s", udpIngressIP)
 
 		By("verifying that TCP and UDP use different load balancers")
 		if tcpIngressIP == udpIngressIP {
@@ -552,7 +574,7 @@ var _ = Describe("Services", func() {
 
 		// Change the services' node ports.
 
-		By("changing the TCP service's " + serviceName + " NodePort")
+		By("changing the TCP service's NodePort")
 		tcpService = jig.ChangeServiceNodePortOrFail(ns1, tcpService.Name, tcpNodePort)
 		jig.SanityCheckService(tcpService, api.ServiceTypeLoadBalancer)
 		tcpNodePortOld := tcpNodePort
@@ -565,7 +587,7 @@ var _ = Describe("Services", func() {
 		}
 		Logf("TCP node port: %d", tcpNodePort)
 
-		By("changing the UDP service's " + serviceName + " NodePort")
+		By("changing the UDP service's NodePort")
 		udpService = jig.ChangeServiceNodePortOrFail(ns2, udpService.Name, udpNodePort)
 		jig.SanityCheckService(udpService, api.ServiceTypeLoadBalancer)
 		udpNodePortOld := udpNodePort
@@ -614,7 +636,6 @@ var _ = Describe("Services", func() {
 		if getIngressPoint(&tcpService.Status.LoadBalancer.Ingress[0]) != tcpIngressIP {
 			Failf("TCP Status.LoadBalancer.Ingress changed (%s -> %s) when not expected", tcpIngressIP, getIngressPoint(&tcpService.Status.LoadBalancer.Ingress[0]))
 		}
-		Logf("service port (TCP and UDP): %d", svcPort)
 
 		By("changing the UDP service's port")
 		udpService = jig.UpdateServiceOrFail(ns2, udpService.Name, func(s *api.Service) {
@@ -631,6 +652,8 @@ var _ = Describe("Services", func() {
 			Failf("UDP Status.LoadBalancer.Ingress changed (%s -> %s) when not expected", udpIngressIP, getIngressPoint(&udpService.Status.LoadBalancer.Ingress[0]))
 		}
 
+		Logf("service port (TCP and UDP): %d", svcPort)
+
 		By("hitting the TCP service's NodePort")
 		jig.TestReachableHTTP(nodeIP, tcpNodePort, kubeProxyLagTimeout)
 
@@ -645,7 +668,7 @@ var _ = Describe("Services", func() {
 
 		// Change the services back to ClusterIP.
 
-		By("changing TCP service " + serviceName + " back to type=ClusterIP")
+		By("changing TCP service back to type=ClusterIP")
 		tcpService = jig.UpdateServiceOrFail(ns1, tcpService.Name, func(s *api.Service) {
 			s.Spec.Type = api.ServiceTypeClusterIP
 			s.Spec.Ports[0].NodePort = 0
@@ -654,7 +677,7 @@ var _ = Describe("Services", func() {
 		tcpService = jig.WaitForLoadBalancerDestroyOrFail(ns1, tcpService.Name, tcpIngressIP, svcPort)
 		jig.SanityCheckService(tcpService, api.ServiceTypeClusterIP)
 
-		By("changing UDP service " + serviceName + " back to type=ClusterIP")
+		By("changing UDP service back to type=ClusterIP")
 		udpService = jig.UpdateServiceOrFail(ns2, udpService.Name, func(s *api.Service) {
 			s.Spec.Type = api.ServiceTypeClusterIP
 			s.Spec.Ports[0].NodePort = 0
